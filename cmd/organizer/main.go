@@ -4,9 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath" // For path validation
+	"path/filepath"
 
-	"github.com/avizyt/org-cli/internal/organizer"
+	"github.com/avizyt/org-cli/internal/oragnizer"
 )
 
 func main() {
@@ -47,7 +47,7 @@ func main() {
 	}
 
 	// Create the Config struct
-	cfg := organizer.Config{
+	cfg := oragnizer.Config{
 		SourceDir: absSourceDir,
 		DestDir:   absDestDir,
 		DryRun:    *dryRun,
@@ -56,7 +56,7 @@ func main() {
 	}
 
 	// 4. Call the organizer logic with the parsed config
-	err = organizer.OrganizeFiles(cfg)
+	err = oragnizer.OrganizeFiles(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error during file organization: %v\n", err)
 		os.Exit(1)
