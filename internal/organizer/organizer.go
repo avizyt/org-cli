@@ -1,3 +1,4 @@
+// internal/organizer/organizer.go
 package organizer
 
 import (
@@ -9,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fatih/color" // Import for colored output
+	"github.com/fatih/color"
 )
 
 // Config holds the configuration for the file organizer.
@@ -20,6 +21,7 @@ type Config struct {
 	Recursive        bool              // If true, scan subdirectories
 	Workers          int               // Number of concurrent workers for file operations
 	CategoryMappings map[string]string // Custom or merged category mappings
+	Quiet            bool
 }
 
 // FileMove represents a single file operation task.
@@ -107,7 +109,7 @@ func DefaultCategoryMappings() map[string]string {
 
 // moveFile performs the actual file moving operation, including collision resolution.
 // It sends progress updates to the provided channel.
-func moveFile(fm FileMove, progressChan chan<- ProgressUpdate) error {
+func moveFile(fm FileMove, progressChan chan<- ProgressUpdate, quiet bool) error {
 	defer func() {
 		// Ensure a progress update is sent even if an error occurs
 		if r := recover(); r != nil {
@@ -119,7 +121,7 @@ func moveFile(fm FileMove, progressChan chan<- ProgressUpdate) error {
 	// Define colors for output
 	green := color.New(color.FgGreen).SprintFunc()
 	yellow := color.New(color.FgYellow).SprintFunc()
-	red := color.New(color.FgRed).SprintFunc()
+	// red := color.New(color.FgRed).SprintFunc()
 	cyan := color.New(color.FgCyan).SprintFunc()
 
 	// Ensure the destination directory exists
@@ -143,7 +145,7 @@ func moveFile(fm FileMove, progressChan chan<- ProgressUpdate) error {
 		// File exists, append timestamp to make it unique
 		ext := filepath.Ext(fm.DestPath)
 		name := strings.TrimSuffix(filepath.Base(fm.DestPath), ext)
-		timestamp := time.Now().Format("20060102_150405") // YYYYMMDD_HHMMSS
+		timestamp := time.Now().Format("20060102_150405") //YYYYMMDD_HHMMSS
 		finalDestPath = filepath.Join(destDir, fmt.Sprintf("%s_%s%s", name, timestamp, ext))
 		fmt.Printf("    %s: Renaming '%s' to '%s'\n", yellow("COLLISION"), filepath.Base(fm.DestPath), filepath.Base(finalDestPath))
 	} else if !os.IsNotExist(err) {
@@ -153,7 +155,9 @@ func moveFile(fm FileMove, progressChan chan<- ProgressUpdate) error {
 	}
 
 	if fm.DryRun {
-		fmt.Printf("    %s: Would move '%s' to '%s'\n", cyan("DRY RUN"), fm.SourcePath, finalDestPath)
+		if !quiet {
+			fmt.Printf("    %s: Would move '%s' to '%s'\n", cyan("DRY RUN"), fm.SourcePath, finalDestPath)
+		}
 		progressChan <- ProgressUpdate{Moved: 1} // Still count as "moved" in dry run for progress
 	} else {
 		err := os.Rename(fm.SourcePath, finalDestPath)
@@ -161,19 +165,21 @@ func moveFile(fm FileMove, progressChan chan<- ProgressUpdate) error {
 			progressChan <- ProgressUpdate{Errored: 1}
 			return fmt.Errorf("failed to move '%s' to '%s': %w", fm.SourcePath, finalDestPath, err)
 		}
-		fmt.Printf("    %s: Moved '%s' to '%s'\n", green("MOVED"), fm.SourcePath, finalDestPath)
+		if !quiet {
+			fmt.Printf("    %s: Moved '%s' to '%s'\n", green("MOVED"), fm.SourcePath, finalDestPath)
+		}
+		// fmt.Printf("    %s: Moved '%s' to '%s'\n", green("MOVED"), fm.SourcePath, finalDestPath)
 		progressChan <- ProgressUpdate{Moved: 1}
 	}
 	return nil
 }
 
 // OrganizeFiles scans the source directory and dispatches file moves to a worker pool.
-// It returns the total files scanned, moved, skipped, and errored.
-func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (int, int, int, int, error) {
+// It returns the total files scanned (including skipped), and the total files that will be processed (sent to workers), and any error from scanning.
+func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (totalScanned int, totalToProcess int, totalSkipped int, scanErr error) {
 	// Define colors for output
 	red := color.New(color.FgRed).SprintFunc()
 	yellow := color.New(color.FgYellow).SprintFunc()
-	green := color.New(color.FgGreen).SprintFunc()
 	blue := color.New(color.FgBlue).SprintFunc()
 
 	fmt.Printf("%s Starting file organization from '%s' to '%s'...\n", blue("🚀"), cfg.SourceDir, cfg.DestDir)
@@ -188,15 +194,13 @@ func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (int, int, in
 	// Phase 1: Scan and Collect Files
 	fmt.Printf("%s Scanning files in '%s'...\n", blue("🔍"), cfg.SourceDir)
 	var filesToMove []FileMove
-	var scanError error
-	skippedCount := 0
 
 	err := filepath.WalkDir(cfg.SourceDir, func(path string, d fs.DirEntry, err error) error {
+		totalScanned++ // Increment total scanned count for every entry (file or dir)
 		if err != nil {
 			fmt.Printf("%s Error accessing path %s: %v. Skipping.\n", red("❌"), path, err)
-			// Don't count as an error for processing, but for scanning errors
-			scanError = fmt.Errorf("encountered error during scan: %w", err)
-			return nil // Continue walking other paths
+			scanErr = fmt.Errorf("encountered error during scan: %w", err) // Store first scan error
+			return nil                                                     // Continue walking other paths
 		}
 
 		if d.IsDir() {
@@ -218,7 +222,7 @@ func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (int, int, in
 		// Skip files that are already in the destination directory (or a subdirectory of it)
 		if strings.HasPrefix(path, cfg.DestDir) {
 			fmt.Printf("  %s %s is already in the destination directory. Skipping.\n", yellow("⚠️"), fileName)
-			skippedCount++
+			totalSkipped++
 			return nil
 		}
 
@@ -235,25 +239,23 @@ func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (int, int, in
 	})
 
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("error walking source directory '%s': %w", cfg.SourceDir, err)
+		return totalScanned, totalToProcess, totalSkipped, fmt.Errorf("error walking source directory '%s': %w", cfg.SourceDir, err)
 	}
-	if scanError != nil {
+	if scanErr != nil { // Report if any errors were encountered during the scan
 		fmt.Printf("%s Scan completed with some errors.\n", yellow("⚠️"))
 	}
 
-	totalFiles := len(filesToMove)
-	if totalFiles == 0 {
+	totalToProcess = len(filesToMove)
+	if totalToProcess == 0 {
 		fmt.Printf("%s No files found to organize.\n", blue("ℹ️"))
-		return 0, 0, skippedCount, 0, nil
+		return totalScanned, totalToProcess, totalSkipped, nil
 	}
 
-	fmt.Printf("%s Found %d files to process.\n", blue("✅"), totalFiles)
+	fmt.Printf("%s Found %d files to process.\n", blue("✅"), totalToProcess)
 
 	// Phase 2: Process Files with Worker Pool
 	workQueue := make(chan FileMove, cfg.Workers*2)
 	var wg sync.WaitGroup
-	movedCount := 0
-	errorCount := 0
 
 	// Start worker goroutines
 	for i := 0; i < cfg.Workers; i++ {
@@ -261,12 +263,8 @@ func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (int, int, in
 		go func(workerID int) {
 			defer wg.Done()
 			for fm := range workQueue {
-				err := moveFile(fm, progressChan)
-				if err != nil {
-					// Error already reported by moveFile, just log here if needed for deeper debug
-					// fmt.Printf("Worker %d: %v\n", workerID, err)
-					// errorCount is incremented via progressChan
-				}
+				// moveFile sends progress updates directly to progressChan
+				_ = moveFile(fm, progressChan, cfg.Quiet) // Ignore error here, it's handled and reported by moveFile
 			}
 		}(i)
 	}
@@ -277,32 +275,9 @@ func OrganizeFiles(cfg Config, progressChan chan<- ProgressUpdate) (int, int, in
 	}
 	close(workQueue) // Close the work queue after all files have been dispatched.
 
-	// Goroutine to collect progress updates
-	go func() {
-		for update := range progressChan {
-			movedCount += update.Moved
-			errorCount += update.Errored
-		}
-	}()
-
 	// Wait for all worker goroutines to finish their tasks.
 	wg.Wait()
-	close(progressChan) // Close the progress channel after all workers are done
+	// Do NOT close progressChan here. It's closed by main.go after its progress collection goroutine finishes.
 
-	fmt.Printf("\n%s --- Summary ---\n", blue("📄"))
-	fmt.Printf("%s Scanned %d files.\n", blue("🔍"), totalFiles+skippedCount) // Total scanned includes skipped
-	fmt.Printf("%s Skipped %d files (already in destination or access error).\n", yellow("⏩"), skippedCount)
-	if cfg.DryRun {
-		fmt.Printf("%s Dry run completed. %s files would have been processed.\n", green("✅"), green(fmt.Sprintf("%d", movedCount)))
-	} else {
-		fmt.Printf("%s Successfully processed %s files.\n", green("✅"), green(fmt.Sprintf("%d", movedCount)))
-	}
-	if errorCount > 0 {
-		fmt.Printf("%s Encountered %s errors during processing.\n", red("❌"), red(fmt.Sprintf("%d", errorCount)))
-	} else {
-		fmt.Printf("%s No errors encountered.\n", green("✔️"))
-	}
-	fmt.Printf("%s File organization process completed.\n", blue("🎉"))
-
-	return totalFiles + skippedCount, movedCount, skippedCount, errorCount, nil // Return actual counts
+	return totalScanned, totalToProcess, totalSkipped, nil
 }
